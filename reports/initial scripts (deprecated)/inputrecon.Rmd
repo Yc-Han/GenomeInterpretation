@@ -1,0 +1,241 @@
+---
+title: "Input Reconstruction"
+author: "Yichen Han"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r pkgs, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+library(deepG)
+library(ggplot2)
+library(microseq)
+library(seqinr)
+library(dplyr)
+library(caret)
+library(pROC)
+library(keras)
+library(magrittr)
+library(patchwork)
+library(ggseqlogo)
+set.seed(42)
+library(reticulate)
+use_python("E:/miniconda/envs/r-reticulate/python.exe", required = TRUE)
+source("genepermutation.R")
+source("ig_modified.R")
+```
+
+```{r setpath}
+# input data are divided into train, validation sets
+path_16S_train <- file.path("16s/train")
+path_16S_validation <- file.path("16s/validation")
+path_bacteria_train <- file.path("bacteria/train")
+path_bacteria_validation <- file.path("bacteria/validation")
+
+checkpoint_path <- file.path("checkpoints")
+tensorboard.log <- file.path("tensorboard")
+
+dir_path <- file.path("outputs")
+```
+
+```{r reload}
+# load model checkpoint with best validation accuracy
+run_name <- "16S_vs_bacteria_full_2"
+model <- load_cp(paste0(checkpoint_path, "/", run_name), 
+                 cp_filter = "last_ep")
+
+# evaluate model
+path_input <- c(path_16S_validation, path_bacteria_validation)
+pred_df_path <- tempfile(fileext = ".rds")
+```
+
+```{r ignew}
+instance <- microseq::readFasta('16s/validation/GCA_002887275.1_ASM288727v1_genomic.16s.fasta.fasta')$Sequence[1]
+instance_sub <- substr(instance, 499, 1098)
+char <- strsplit(instance_sub, "")[[1]]
+trip_instance <- sapply(seq(1, length(char), by = 3), function(i) {
+  paste(char[i:min(i+2, length(char))], collapse = "")
+})
+keyed_instance <- triplets_keying(trip_instance)
+df_key <- data.frame(
+  trip = trip_instance,
+  key = keyed_instance,
+  group = 1:200
+)
+# left join df_key to df_clusters by group
+onehot_instance <-  seq_encoding_label(char_sequence = instance_sub,
+                                          maxlen = 600,
+                                          start_ind = 1,
+                                          vocabulary = c("A", "C", "G", "T"))
+baseline <- microseq::readFasta('bacteria/validation/GCF_002895085.1_ASM289508v1_genomic.fasta')$Sequence[1]
+baseline_sub <- substr(baseline, 499, 1098)
+# onehot_baseline <- onehot_instance * 0 + 0.25
+onehot_baseline <- seq_encoding_label(char_sequence = baseline_sub,
+                                          maxlen = 600,
+                                          start_ind = 1,
+                                          vocabulary = c("A", "C", "G", "T"))
+pred <- predict(model, onehot_instance, verbose = 0)
+pred
+igs <- ig_modified(
+  input_seq = onehot_instance,
+  baseline_type = "modify",
+  baseline_onehot = onehot_baseline,
+  target_class_idx = 1,
+  model = model,
+  num_baseline_repeats = 1)
+heatmaps_integrated_grad(integrated_grads = igs,
+                         input_seq = onehot_instance)
+sum <- rowSums(as.array(igs))
+abs_sum <- rowSums(abs(as.array(igs)))
+df <- data.frame(abs_sum = abs_sum, sum=sum, position = 1 : 600)
+
+ggplot(df, aes(x = position, y = abs_sum)) + geom_point() + geom_smooth(method = "gam") + theme_bw()
+ggplot(df, aes(x = position, y = sum)) + geom_point() + theme_bw()
+```
+
+```{r recon}
+# we now use igs to reconstruct instance that can be predicted as 1 at confidence 0.8
+# we do: baseline_(t+1) = baseline_(t) + 0.001 * igs, and go through model
+# if pred[1] > 0.8, break the loop.
+# predict using predict(model, onehot_instance, verbose = 0)
+count <- 0
+epsilon <- 2
+baseline <- onehot_instance * 0 + 0.01
+conf <- numeric()
+# Iteratively update the baseline
+repeat {
+  # Compute Integrated Gradients for the current baseline
+  igt <- ig_modified(
+  input_seq = onehot_instance,
+  baseline_type = "modify",
+  baseline_onehot = baseline,
+  target_class_idx = 1,
+  model = model,
+  num_baseline_repeats = 1)
+  baseline_old <- baseline
+  pred_old <- pred
+  # Update the baseline input
+  baseline <- as.array(baseline + epsilon * igt)
+  # if any cell in baseline < 0, change to 0
+  baseline[baseline < 0] <- 0
+  count <- count + 1
+  # Predict using the updated baseline
+  pred <- predict(model, baseline, verbose = 0)
+  conf <- c(conf, pred[1,1])
+  print(paste0("Iteration", count, ": ", pred[1,1]))
+  # Check the prediction for class "1"
+  if (pred[1,1] > 0.99) {
+    break
+  } else if (all(baseline_old == baseline)) {
+    warning("Not moving")
+    break
+  } else if (pred_old[1,1] > pred[1,1]) {
+    warning("decreasing confidence, returned to the previous step")
+    baseline <- baseline_old
+    break
+  }
+}
+```
+
+```{r reconplot, cache=TRUE}
+# line plot for conf
+ggplot(data = data.frame(iteration = 1:length(conf), conf = conf), aes(x = iteration, y = conf)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Iteration", y = "Confidence")
+# Convert the array to a data frame for ggplot
+baseline.arr <- as.array(baseline)
+baseline.arr <- t(baseline.arr[1,,])
+df <- as.data.frame(baseline.arr)
+
+# Add row names for A, C, G, T
+rownames(df) <- c("A", "C", "G", "T")
+df_mat <- as.matrix(df)
+ggseqlogo(df_mat, method='custom', seq_type='dna') + xlim(100,200) + ylim(-1.1,1.1) +
+  labs(x="bp", y="IG")
+```
+
+```{r reconeval}
+# make the max of each baseline[,i,] 1 and the rest 0
+onehot_baseline <- as.array(baseline)
+for (j in 1:dim(onehot_baseline)[2]) {
+  # Find the index of the maximum value in the 4 values
+  max_index <- which.max(onehot_baseline[1, j, ])
+  
+  # Set the maximum value position to 1 and others to 0
+  onehot_baseline[1, j, ] <- 0
+  onehot_baseline[1, j, max_index] <- 1
+}
+sequence <- character(600)
+
+# Define the mapping from index to nucleotide
+nucleotide_map <- c("A", "C", "G", "T")
+
+# Loop over the 477 positions
+for (i in 1:600) {
+  # Find the index where the value is 1
+  nucleotide_index <- which(onehot_baseline[1, i, ] == 1)
+  
+  # Map the index to the corresponding nucleotide
+  sequence[i] <- nucleotide_map[nucleotide_index]
+}
+
+# Collapse the character vector into a single string
+sequence_string <- paste(sequence, collapse = "")
+```
+
+```{r reconkey}
+recon_split <- strsplit(sequence_string, "")[[1]]
+recon_trip <- tokenize_triplets(recon_split)
+recon_keyed <- triplets_keying(recon_trip)
+ins_split <- strsplit(instance_sub, "")[[1]]
+ins_trip <- tokenize_triplets(ins_split)
+ins_keyed <- triplets_keying(ins_trip)
+
+# positions where name of recon_keyed == ins_keyed
+matched <- which(recon_keyed == ins_keyed)
+print("Matched Reconstructed sequence and original sequence, AA position: ")
+matched
+```
+
+```{r adversarial, cache=TRUE}
+adversarial <- onehot_instance
+pred_vor <- predict(model, adversarial, verbose = 0)
+print("Original Prediction: ")
+pred_vor
+adversarial[,matched,] <- onehot_instance[,matched,]*0
+adversarial[,matched, 2] <- 1
+pred_adv <- predict(model, adversarial, verbose = 0)
+print("Prediction after substituting matched features with C: ")
+pred_adv
+counter <- onehot_instance
+pred_counter_results <- numeric(200)
+# Loop 100 times
+for (i in 1:200) {
+  # Sample indices from not_selected
+  indices <- sample(seq_len(ncol(onehot_instance)), length(matched))
+  
+  # Create a counter-adversarial example
+  counter <- onehot_instance
+  counter[,indices,] <- onehot_instance[,indices,]*0
+  counter[,indices, 2] <- 1
+  
+  # Make prediction on the counter-adversarial example
+  pred_counter <- predict(model, counter, verbose = 0)
+  
+  # Store the result for pred_counter[1,1]
+  pred_counter_results[i] <- pred_counter[1,1]
+}
+
+# Calculate the mean of the pred_counter[1,1] values
+mean_pred_counter <- mean(pred_counter_results)
+
+# Print the mean
+print("Prediction after substituting same amount of random features with C: ")
+mean_pred_counter
+```
+

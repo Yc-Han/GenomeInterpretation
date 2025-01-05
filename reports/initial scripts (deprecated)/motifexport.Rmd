@@ -1,0 +1,127 @@
+---
+title: "Motif Export"
+author: "Yichen Han"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r pkgs, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+library(deepG)
+library(ggplot2)
+library(microseq)
+library(seqinr)
+library(dplyr)
+library(caret)
+library(pROC)
+library(keras)
+library(magrittr)
+library(patchwork)
+library(ggseqlogo)
+set.seed(42)
+library(reticulate)
+library(data.table)
+use_python("E:/miniconda/envs/r-reticulate/python.exe", required = TRUE)
+source("genepermutation.R")
+source("ig_modified.R")
+source("seqsyn.R")
+```
+
+# Motif detection
+
+Based on randomly generated sequence with length 450 bp, ACGT are drawn with equal probs, and then insert a motif `TATAGCGCAGCTGTCAGCATGAGTCCATGA` at a random starting point. Data 10000.
+
+Model: LSTM-CNN, learning rate 0.001, batch size 32, accuracy 100%.
+
+```{r hist}
+# load outputs/hist39.rds
+histmotif <- readRDS(file="outputs/histMotifeqcnn.rds")
+plot(histmotif)
+```
+
+```{r load model}
+motif <- "TATAGCGCAGCTGTCAGCATGAGTCCATGA"
+checkpoint_path <- file.path("checkpoints")
+dir_path <- file.path("outputs")
+run_name <- "motifeq-both_2"
+model <- load_cp(paste0(checkpoint_path, "/", run_name), 
+                 cp_filter = "last_ep")
+```
+
+## Model Evaluation
+
+```{r evaluate2}
+path_normal_test <- file.path("motifeq/normal/test")
+path_motif_test <- file.path("motifeq/motif/test")
+eval_model <- evaluate_model(path_input = c(path_normal_test,
+  path_motif_test),
+  model = model,
+  batch_size = 128,
+  step = 10,
+  vocabulary_label = list(c("normal", "motif")),
+  number_batches = 10,
+  mode = "label_folder",
+  verbose = FALSE
+)
+eval_model
+```
+
+## IG
+
+Baseline: 0.25
+
+```{r ig}
+instance <- microseq::readFasta('motifeq/motif/test/1002.fasta')$Sequence[1]
+onehot_instance <-  seq_encoding_label(char_sequence = instance,
+                                          maxlen = 450,
+                                          start_ind = 1,
+                                          vocabulary = c("A", "C", "G", "T"))
+motif_pos <- find_motif(instance, motif)
+motif_end <- motif_pos + nchar(motif)
+onehot_baseline_25 <- onehot_instance * 0 + 0.25
+pred <- predict(model, onehot_instance, verbose = 0)
+pred
+
+ig25 <- ig_modified(m_steps = 400,
+  input_seq = onehot_instance,
+  baseline_type = "modify",
+  baseline_onehot = onehot_baseline_25,
+  target_class_idx = 2,
+  model = model,
+  num_baseline_repeats = 1)
+heatmaps_integrated_grad(integrated_grads = ig25,
+                         input_seq = onehot_instance)
+sum <- rowSums(as.array(ig25))
+abs_sum <- rowSums(abs(as.array(ig25)))
+df25 <- data.frame(abs_sum = abs_sum, sum=sum, position = 1 : 450)
+
+ggplot(df25, aes(x = position, y = abs_sum))+ geom_rect(aes(xmin = motif_pos, xmax = motif_end, ymin = -Inf, ymax = Inf), fill = "lightblue", alpha = 0.2) + geom_point() + theme_bw() + labs(subtitle = "Baseline 0")
+```
+
+```{r seqlogo}
+igmat <- as.data.frame(t(as.matrix(ig25)))
+rownames(igmat) <- c("A", "C", "G", "T")
+igmat <- as.matrix(igmat)
+ggseqlogo(igmat, method='custom', seq_type='dna') + xlim(motif_pos-20,motif_end+20) + labs(x="bp", y="IG") + geom_rect(aes(xmin = motif_pos, xmax = motif_end, ymin = -Inf, ymax = Inf), fill = "lightblue", alpha = 0.2) +
+  # add motif as text
+  geom_text(aes(x = motif_pos + 15, y = -0.025, label = motif), size = 3.25, color = "blue")
+```
+
+```{r match eval}
+# extract motif_pos ~ motif_end from igmat
+motifregion <- igmat[, motif_pos:(motif_end-1)]
+# get row name of max in each column
+row_max_in_cols <- apply(motifregion, 2, function(col) rownames(igmat)[which.max(col)])
+
+# Print the result
+interpret <- unname(row_max_in_cols)
+
+motif_letters <- strsplit(motif, split = "")[[1]]
+
+# calculate difference between interpret and motif_letters
+sum(interpret == motif_letters) / length(motif_letters)
+```

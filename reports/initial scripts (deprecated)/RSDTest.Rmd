@@ -1,0 +1,395 @@
+---
+title: "RSDTest"
+author: "Yichen Han"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r pkgs, message=FALSE, warning=FALSE}
+library(deepG)
+library(ggplot2)
+library(microseq)
+library(seqinr)
+library(dplyr)
+library(caret)
+set.seed(42)
+source("genepermutation.R")
+```
+
+```{r init}
+# delete folder: normal, sepcial, abnormal
+unlink("normal", recursive = TRUE)
+unlink("abnormal", recursive = TRUE)
+unlink("special", recursive = TRUE)
+```
+
+```{r raw data}
+rsd <- seqinr::read.fasta("rsd.FASTA", seqtype = "DNA")
+rsd <- toupper(unlist(seqinr::getSequence(rsd)))
+```
+
+```{r genepermutation}
+# if synthetic data at exp39.csv exists, read it in as test, skip this
+if (!file.exists("synthetic data at exp39.csv")) {
+  triplets <- tokenize_triplets(rsd)
+  keyed <- triplets_keying(triplets)
+  test <- GenePermutation(triplets, num.perm=15000, min.subs=10, max.subs=30,
+                          spec.region=30:60)
+  test <- test %>%
+    mutate(seq = sapply(seq, paste, collapse = ""))
+  # save test as csv
+  write.csv(test, "synthetic data at exp39.csv")
+} else {
+  test <- read.csv("synthetic data at exp39.csv")
+}
+  table(test$label)
+```
+
+```{r split}
+# perform random train-validation-test split:
+# Create indices for the training set (let's say 60% of the data)
+training_indices <- createDataPartition(test$label, p = 0.6, list = FALSE)
+
+# Create the training set
+training_set <- test[training_indices, ]
+
+# Split the remaining 40% into validation and test sets (50% each of the remaining)
+remaining_indices <- setdiff(row.names(test), row.names(training_set))
+remaining_set <- test[remaining_indices, ]
+validation_indices <- createDataPartition(remaining_set$label, p = 0.5, list = FALSE)
+
+# Create validation and test sets
+validation_set <- remaining_set[validation_indices, ]
+test_set <- remaining_set[-validation_indices, ]
+```
+
+```{r save into folders}
+# create folders: normal, abnormal, special
+## within each of them create train, validation, test folders
+dir.create("normal")
+dir.create("abnormal")
+dir.create("special")
+dir.create("normal/train")
+dir.create("normal/validation")
+dir.create("normal/test")
+dir.create("abnormal/train")
+dir.create("abnormal/validation")
+dir.create("abnormal/test")
+dir.create("special/train")
+dir.create("special/validation")
+dir.create("special/test")
+# write each row into a FASTA file in corresponding folder, according to label
+write_fasta <- function(data_set, set_name) {
+  for (i in 1:nrow(data_set)) {
+    # Define file path based on label and dataset type
+    file_path <- paste0(data_set$label[i], "/", set_name, "/", i, ".fasta")
+    
+    # Create a data frame expected by microseq::writeFasta
+    fasta_data <- data_set$seq[i]
+    
+    # Write FASTA file
+    seqinr::write.fasta(fasta_data, file.out = file_path, names = i)
+  }
+}
+
+# Apply the function to each dataset
+write_fasta(training_set, "train")
+write_fasta(validation_set, "validation")
+write_fasta(test_set, "test")
+```
+
+```{r modelarchitecture, message=FALSE}
+model <- create_model_lstm_cnn(
+  maxlen = 477,
+  layer_lstm = NULL,
+  layer_dense = c(3L),
+  vocabulary_size = 4,
+  kernel_size = c(12, 12, 12),
+  filters = c(32, 64, 128),
+  pool_size = c(3, 3, 3),
+  learning_rate = 0.01
+)
+path_checkpoint <- file.path("checkpoints")
+dir_path <- file.path("outputs")
+unlink(paste0(path_checkpoint, "/rsdtest/*"))
+unlink(paste0(path_checkpoint, "/lm_rsd_target_middle_lstm/*"))
+if (!dir.exists(path_checkpoint)) dir.create(path_checkpoint)
+if (!dir.exists(dir_path)) dir.create(dir_path)
+```
+
+```{r train}
+path_normal_train <- file.path("normal/train")
+path_normal_validation <- file.path("normal/validation")
+path_abnormal_train <- file.path("abnormal/train")
+path_abnormal_validation <- file.path("abnormal/validation")
+path_special_train <- file.path("special/train")
+path_special_validation <- file.path("special/validation")
+
+hist <- train_model(train_type = "label_folder",
+  model = model,
+  path = c(path_normal_train, path_abnormal_train, path_special_train), # path to training files
+  path_val = c(path_normal_validation, path_abnormal_validation, path_special_validation), # path to validation files
+  vocabulary_label = c("normal", "abnormal", "special"),
+  path_checkpoint = path_checkpoint,
+  train_val_ratio = 0.2,
+  run_name = "rsd-permutation",
+  batch_size = 64, # number of samples to process in parallel
+  steps_per_epoch = 45, # 1 epoch = 15 batches
+  epochs = 10,
+  save_best_only = FALSE,
+  step = c(1, 1, 1))
+plot(hist)
+# save hist
+# saveRDS(hist, file = "outputs/hist39.rds")
+```
+
+```{r evamodel}
+path_special_test <- file.path("special/test")
+path_normal_test <- file.path("normal/test")
+path_abnormal_test <- file.path("abnormal/test")
+eval_model <- evaluate_model(path_input = c(path_normal_test,
+  path_abnormal_test, path_special_test),
+  model = model,
+  batch_size = 64,
+  step = 5,
+  vocabulary_label = list(c("normal", "abnormal", "special")),
+  number_batches = 10,
+  mode = "label_folder",
+  verbose = FALSE
+)
+
+eval_model
+```
+
+```{r ig39, warning=FALSE}
+# create one instance with label special
+model39 <- load_cp(paste0(file.path("checkpoints"), "/", "rsd-permutation_39"), 
+                 cp_filter = "last_ep")
+special_seq <- permute_sequence(triplets, type="ok", min.subs=10, max.subs=30,
+                                dict=codon.dict, spec.cond=FALSE, spec.region=NULL)
+special_seq <- permute_sequence(special_seq, type="func", min.subs=10, max.subs=30,
+                                dict=codon.dict, spec.cond=TRUE, spec.region=30:60)
+special_seq <- paste(special_seq, collapse = "")
+onehot_instance <-  seq_encoding_label(char_sequence = special_seq,
+                                          maxlen = 477,
+                                          start_ind = 1,
+                                          vocabulary = c("A", "C", "G", "T"))
+head(onehot_instance[1,,])
+pred <- predict(model39, onehot_instance, verbose = 0)
+pred
+ig <- integrated_gradients(
+  input_seq = onehot_instance,
+  baseline_type = "shuffle",
+  target_class_idx = 3,
+  model = model39,
+  num_baseline_repeats = 50)
+
+heatmaps_integrated_grad(integrated_grads = ig,
+                         input_seq = onehot_instance)
+
+abs_sum <- rowSums(abs(as.array(ig)))
+df <- data.frame(abs_sum = abs_sum, position = 1 : 477)
+ggplot(df, aes(x = position, y = abs_sum)) + geom_rect(aes(xmin = 90, xmax = 180, ymin = -Inf, ymax = Inf), fill = "lightblue", alpha = 0.2) + geom_smooth(method = "auto") + geom_point() + theme_bw()
+```
+
+```{r igmodif}
+# abs_sum <- rowSums(abs(as.array(ig)))
+#df <- data.frame(abs_sum = abs_sum, position = 1 : 477)
+#ggplot(df, aes(x = position, y = abs_sum)) + geom_rect(aes(xmin = 90, xmax = 180, ymin = -Inf, ymax = Inf), fill = "lightblue", alpha = 0.2) + geom_smooth(method = "auto") + geom_point() + theme_bw()
+
+# modification: df should be summed every 3 rows, position reassigned accordingly.
+df_mod <- df %>%
+  mutate(group = rep(1:(nrow(df) / 3), each = 3)) %>%
+  group_by(group) %>%
+  summarise(
+    abs_sum_sum = sum(abs_sum),
+    abs_sum_median = median(abs_sum),
+    abs_sum_mean = mean(abs_sum),
+    abs_sum_max = max(abs_sum)
+  )
+
+# Split special_seq (a string) into triplets (every third character)
+chars <- strsplit(special_seq, "")[[1]]
+
+# Create triplets
+trip_spec <- sapply(seq(1, length(chars), by = 3), function(i) {
+  paste(chars[i:min(i+2, length(chars))], collapse = "")
+})
+
+# Get the index of sequences at which trip_spec != triplets
+index <- which(trip_spec != triplets)
+
+# Plot the results with different smooth lines for sum, median, mean, and max
+ggplot(df_mod, aes(x = group)) +
+  geom_rect(aes(xmin = 30, xmax = 60, ymin = -Inf, ymax = Inf), fill = "lightblue", alpha = 0.2) +
+  # draw points of max
+  geom_point(aes(x = group, y = abs_sum_max), color = "purple") +
+  geom_smooth(aes(y = abs_sum_sum, color = "Sum"), method = "auto", se = FALSE) +
+  geom_smooth(aes(y = abs_sum_median, color = "Median"), method = "auto", se = FALSE) +
+  geom_smooth(aes(y = abs_sum_mean, color = "Mean"), method = "auto", se = FALSE) +
+  geom_smooth(aes(y = abs_sum_max, color = "Max"), method = "auto", se = FALSE) +
+  scale_color_manual(values = c("Sum" = "blue", "Median" = "green", "Mean" = "orange", "Max" = "purple")) +
+  geom_point(data = data.frame(group = index), aes(x = group, y = 0), shape = 4, size = 3, color = "red") +
+  theme_bw() +
+  labs(y = "Absolute Sum of IG", color = "Statistic", x = "AA Index")
+```
+
+```{r wobbleness}
+# calculate mean of first, second, and third codon positions
+mean_codon <- sapply(1:3, function(i) {
+  mean(df$abs_sum[seq(i, 477, by = 3)])
+})
+# plot with line. x:1,2,3, y: mean_codon
+ggplot(data = data.frame(x = 1:3, y = mean_codon), aes(x = x, y = y)) +
+  geom_line() +
+  geom_point() +
+  theme_bw()
+```
+
+```{r bykey}
+keyed_spec <- triplets_keying(trip_spec)
+df_keyed <- cbind(keyed_spec, trip_spec, df_mod)
+# mutate two colmuns: cod1 is the first character in trip_spec, cod23 is the 2-3 chars in trip_spec
+df_keyed <- df_keyed %>%
+  mutate(cod1 = substr(trip_spec, 1, 1),
+         cod23 = substr(trip_spec, 2, 3))
+df_keyed <- df_keyed %>%
+  group_by(keyed_spec) %>%
+  mutate(value = mean(abs_sum_sum))
+
+ggplot(df_keyed, aes(x = cod1, y = cod23, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = keyed_spec), color = "black", size = 3) +
+  scale_fill_gradient2(low = "purple", mid = "green", high = "orange", midpoint = 0.0025) + 
+  theme_bw() +
+  labs(fill = "Average Sum\nof AA Abs Sum",
+       x = "First Codon Position",
+       y = "Second and Third Codon Position") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        strip.text = element_text(face = "bold"),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+```
+
+```{r autocor}
+cor_values <- acf(df_mod$abs_sum_sum, lag.max = 159, plot = TRUE)
+```
+
+```{r css, cache=TRUE}
+instance <- permute_sequence(triplets, type="ok", min.subs=10, max.subs=30,
+                                dict=codon.dict, spec.cond=FALSE, spec.region=NULL)
+instance <- permute_sequence(instance, type="func", min.subs=10, max.subs=30,
+                                dict=codon.dict, spec.cond=TRUE, spec.region=30:60)
+# begin
+instance_pasted <- paste(instance, collapse = "")
+chars <- strsplit(instance_pasted, "")[[1]]
+trip_instance <- sapply(seq(1, length(chars), by = 3), function(i) {
+  paste(chars[i:min(i+2, length(chars))], collapse = "")
+})
+keyed_instance <- triplets_keying(trip_instance)
+onehot_instance <-  seq_encoding_label(char_sequence = instance_pasted,
+                                          maxlen = 477,
+                                          start_ind = 1,
+                                          vocabulary = c("A", "C", "G", "T"))
+ig_instance <- integrated_gradients(
+  input_seq = onehot_instance,
+  baseline_type = "shuffle",
+  target_class_idx = 3,
+  model = model39,
+  num_baseline_repeats = 50)
+abs_sum <- rowSums(abs(as.array(ig_instance)))
+df <- data.frame(abs_sum = abs_sum, position = 1 : 477)
+df_mod <- df %>%
+  mutate(group = rep(1:(nrow(df) / 3), each = 3)) %>%
+  group_by(group) %>%
+  summarise(
+    abs_sum_mean = mean(abs_sum)
+  )
+df_keyed <- cbind(keyed_instance, trip_instance, df_mod)
+# delete row if keyed_instance in "M","W"
+df_keyed <- df_keyed %>%
+  filter(!(keyed_instance %in% c("M", "W", "*")))
+# groupby keyed_instance, calculate std of abs_sum_mean using summary
+df_std <- df_keyed %>%
+  group_by(keyed_instance) %>%
+  summarise(std = sd(abs_sum_mean))
+css_instance_init <- mean(df_std$std, na.rm=TRUE)
+
+# use: permute_sequence(instance, type="ok", min.subs=30, max.subs=80,
+#                       dict=codon.dict, spec.cond=FALSE, spec.region=NULL)
+# to create 100 instances, and repeat everything from "#begin"
+# for each permuted instance.
+# Save all css_instance, excluding the original one, into css vector
+```
+
+```{r loopcss, cache=TRUE}
+css_values <- numeric(100)
+
+# Loop to create 100 permuted instances
+for (i in 1:100) {
+  # Create a permuted instance with the specified parameters
+  permuted_instance <- permute_sequence(instance, type = "ok", min.subs = 10, max.subs = 30,
+                                        dict = codon.dict, spec.cond = FALSE, spec.region = NULL)
+  
+  # Start the process for the new permuted instance
+  permuted_instance <- paste(permuted_instance, collapse = "")
+  chars <- strsplit(permuted_instance, "")[[1]]
+  trip_instance <- sapply(seq(1, length(chars), by = 3), function(i) {
+    paste(chars[i:min(i+2, length(chars))], collapse = "")
+  })
+  keyed_instance <- triplets_keying(trip_instance)
+  onehot_instance <- seq_encoding_label(char_sequence = permuted_instance,
+                                        maxlen = 477,
+                                        start_ind = 1,
+                                        vocabulary = c("A", "C", "G", "T"))
+  
+  ig_instance <- integrated_gradients(
+    input_seq = onehot_instance,
+    baseline_type = "shuffle",
+    target_class_idx = 3,
+    model = model39,
+    num_baseline_repeats = 50
+  )
+  
+  abs_sum <- rowSums(abs(as.array(ig_instance)))
+  df <- data.frame(abs_sum = abs_sum, position = 1:477)
+  df_mod <- df %>%
+    mutate(group = rep(1:(nrow(df) / 3), each = 3)) %>%
+    group_by(group) %>%
+    summarise(
+      abs_sum_mean = mean(abs_sum)
+    )
+  
+  df_keyed <- cbind(keyed_instance, trip_instance, df_mod)
+  
+  # Delete rows where keyed_instance is "M", "W", or "*"
+  df_keyed <- df_keyed %>%
+    filter(!(keyed_instance %in% c("M", "W", "*")))
+  
+  # Group by keyed_instance and calculate the standard deviation of abs_sum_mean
+  df_std <- df_keyed %>%
+    group_by(keyed_instance) %>%
+    summarise(std = sd(abs_sum_mean))
+  
+  # Calculate the css_instance for this permuted instance
+  css_instance <- mean(df_std$std, na.rm=TRUE)
+  
+  # Store the css_instance in the vector
+  css_values[i] <- css_instance
+}
+
+css_values
+```
+
+```{r cssplot}
+# density curve of css_values
+dfcss <- data.frame(CSS = css_values)
+ggplot(dfcss, aes(x = CSS)) +
+  geom_density(color = "blue", alpha = 0.5) +
+  theme_bw() +
+  # a dotted vertical line of x=css_instance_init
+  geom_vline(xintercept = css_instance_init, linetype = "dotted", color = "red", lwd=1)
+```

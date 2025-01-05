@@ -1,0 +1,1010 @@
+---
+title: 'Real Data: 16s rRNA'
+author: "Yichen Han"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r pkgs, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+library(deepG)
+library(ggplot2)
+library(microseq)
+library(seqinr)
+library(dplyr)
+library(caret)
+library(pROC)
+library(keras)
+library(magrittr)
+library(patchwork)
+library(ggseqlogo)
+set.seed(42)
+library(reticulate)
+use_python("E:/miniconda/envs/r-reticulate/python.exe", required = TRUE)
+source("genepermutation.R")
+source("ig_modified.R")
+```
+
+After modifying IG implementation and testing it on synthetic data, we now want to work with real data. We choose a rather simple task as already done by the package dvp-team: 16S rRNA gene detection vs. bacterial genomes.
+
+## Pretrained Model
+
+We load the best model as instructed by the online tutorial.
+
+```{r setpath}
+# input data are divided into train, validation sets
+path_16S_train <- file.path("16s/train")
+path_16S_validation <- file.path("16s/validation")
+path_bacteria_train <- file.path("bacteria/train")
+path_bacteria_validation <- file.path("bacteria/validation")
+
+checkpoint_path <- file.path("checkpoints")
+tensorboard.log <- file.path("tensorboard")
+
+dir_path <- file.path("outputs")
+#unlink(paste0(checkpoint_path, "/16S_vs_bacteria_checkpoints/*"))
+#unlink(paste0(checkpoint_path, "/lm_16S_target_middle_lstm/*"))
+#if (!dir.exists(checkpoint_path)) dir.create(checkpoint_path)
+#if (!dir.exists(tensorboard.log)) dir.create(tensorboard.log)
+#if (!dir.exists(dir_path)) dir.create(dir_path)
+```
+
+```{r load model}
+# load model checkpoint with best validation accuracy
+run_name <- "16S_vs_bacteria_checkpoints"
+model <- load_cp(paste0(checkpoint_path, "/", run_name), 
+                 cp_filter = "last_ep")
+
+# evaluate model
+path_input <- c(path_16S_validation, path_bacteria_validation)
+pred_df_path <- tempfile(fileext = ".rds")
+eval_model <- evaluate_model(path_input = path_input,
+  model = model,
+  batch_size = 250,
+  step = 500,
+  vocabulary_label = c("16s", "bacteria"),
+  number_batches = 10,
+  mode = "label_folder",
+  verbose = FALSE,
+  auc = TRUE,
+  proportion_per_seq = 0.98,
+  max_samples = 500,
+  path_pred_list = pred_df_path)
+
+eval_model
+```
+We see that the model has very high accuracy.
+
+We then load a random 16S gene sequence from the validation data, and load a bacteria genome from the validation data as our baseline. We extract positions 499-998 (500 bp) for both sequences.
+
+We then perform modified IG.
+
+```{r igtest}
+# instance is a randomly chosen fasta file from 16s validation
+instance <- microseq::readFasta('16s/validation/GCF_001986655.1_ASM198665v1_genomic.16s.fasta.fasta')$Sequence[1]
+instance_sub <- substr(instance, 499, 998)
+onehot_instance <-  seq_encoding_label(char_sequence = instance_sub,
+                                          maxlen = 500,
+                                          start_ind = 1,
+                                          vocabulary = c("A", "C", "G", "T"))
+baseline <- microseq::readFasta('bacteria/validation/GCF_002895085.1_ASM289508v1_genomic.fasta')$Sequence[1]
+baseline_sub <- substr(baseline, 499, 998)
+onehot_baseline <- seq_encoding_label(char_sequence = baseline_sub,
+                                          maxlen = 500,
+                                          start_ind = 1,
+                                          vocabulary = c("A", "C", "G", "T"))
+pred <- predict(model, onehot_instance, verbose = 0)
+pred
+igs <- ig_modified(
+  input_seq = onehot_instance,
+  baseline_type = "modify",
+  baseline_onehot = onehot_baseline,
+  target_class_idx = 1,
+  model = model,
+  num_baseline_repeats = 1)
+heatmaps_integrated_grad(integrated_grads = igs,
+                         input_seq = onehot_instance)
+sum <- rowSums(as.array(igs))
+abs_sum <- rowSums(abs(as.array(igs)))
+df <- data.frame(abs_sum = abs_sum, sum=sum, position = 1 : 500)
+
+ggplot(df, aes(x = position, y = abs_sum)) + geom_point() + geom_smooth() + theme_bw()
+ggplot(df, aes(x = position, y = sum)) + geom_point() + theme_bw()
+```
+
+We noticed approximately 0 importance assigned to the first 300 bp, and a monotonic rise in the last 200. We repeat the process on different targets.
+
+We discovered that the emphasis on the tail is recurrent whatever instance, baseline, or sequence starting index. This does not reflect the true traits of 16S rRNA gene, and is not logical.
+
+We noticed the model specifications:
+
+```{r modelspec, eval=FALSE, echo=TRUE}
+model <- create_model_lstm_cnn(
+  maxlen = 500, # not divisible by 3
+  layer_lstm = NULL,
+  layer_dense = c(2L),
+  vocabulary_size = 4,
+  kernel_size = c(12, 12, 12),
+  filters = c(32, 64, 128),
+  pool_size = c(3, 3, 3),
+  learning_rate = 0.001)
+
+train_model(train_type = "label_folder",
+  model = model,
+  path = c(path_16S_train, path_bacteria_train),
+  path_val = c(path_16S_validation, path_bacteria_validation),
+  vocabulary_label = c("16s", "bacteria"),
+  path_checkpoint = checkpoint_path,
+  train_val_ratio = 0.2,
+  run_name = run_name,
+  batch_size = 256,
+  steps_per_epoch = 25,
+  epochs = 8, 
+  save_best_only = FALSE,
+  step = c(100, 500), # take sample every 100 step for 16S and every 500 for bacteria  
+  proportion_per_seq = c(0.95, 0.05))
+```
+
+The length is not divisible by 3, and when the instance is introduced after `substr`, the original codon structure is broken, and the model did very likely not capture codon structure during the training at all.
+
+We speculate the model to be not biologically trustworthy. We thus retrain a model.
+
+```{r build, eval=FALSE, echo=TRUE}
+model <- create_model_lstm_cnn(
+  maxlen = 600, # size divisible by 3
+  ...)
+
+train_model(train_type = "label_folder",
+  ...
+  step = c(6, 30), # smaller steps, divisible by 3
+  ...)
+```
+
+## Retrained Model
+
+We load the model at last epoch:
+
+```{r reload}
+# load model checkpoint with best validation accuracy
+run_name <- "16S_vs_bacteria_full_2"
+model <- load_cp(paste0(checkpoint_path, "/", run_name), 
+                 cp_filter = "last_ep")
+
+# evaluate model
+path_input <- c(path_16S_validation, path_bacteria_validation)
+pred_df_path <- tempfile(fileext = ".rds")
+eval_model <- evaluate_model(path_input = path_input,
+  model = model,
+  batch_size = 250,
+  step = 500,
+  vocabulary_label = c("16s", "bacteria"),
+  number_batches = 10,
+  mode = "label_folder",
+  verbose = FALSE,
+  auc = TRUE,
+  proportion_per_seq = 0.98,
+  max_samples = 500,
+  path_pred_list = pred_df_path)
+
+eval_model
+```
+It still has a very high accuracy. We evaluate it again using modified IG.
+
+Instance: GCF_001986655.1_ASM198665v1_genomic.16s.fasta 499-1098 bp.
+
+Baseline: GCF_002895085.1_ASM289508v1_genomic.fasta 499-1098 bp.
+
+```{r ignew}
+instance <- microseq::readFasta('16s/validation/GCF_001986655.1_ASM198665v1_genomic.16s.fasta.fasta')$Sequence[1]
+instance_sub <- substr(instance, 499, 1098)
+onehot_instance <-  seq_encoding_label(char_sequence = instance_sub,
+                                          maxlen = 600,
+                                          start_ind = 1,
+                                          vocabulary = c("A", "C", "G", "T"))
+baseline <- microseq::readFasta('bacteria/validation/GCF_002895085.1_ASM289508v1_genomic.fasta')$Sequence[1]
+baseline_sub <- substr(baseline, 499, 1098)
+# onehot_baseline <- onehot_instance * 0 + 0.25
+onehot_baseline <- seq_encoding_label(char_sequence = baseline_sub,
+                                          maxlen = 600,
+                                          start_ind = 1,
+                                          vocabulary = c("A", "C", "G", "T"))
+pred <- predict(model, onehot_instance, verbose = 0)
+pred
+igs <- ig_modified(
+  input_seq = onehot_instance,
+  baseline_type = "modify",
+  baseline_onehot = onehot_baseline,
+  target_class_idx = 1,
+  model = model,
+  num_baseline_repeats = 1)
+heatmaps_integrated_grad(integrated_grads = igs,
+                         input_seq = onehot_instance)
+sum <- rowSums(as.array(igs))
+abs_sum <- rowSums(abs(as.array(igs)))
+df <- data.frame(abs_sum = abs_sum, sum=sum, position = 1 : 600)
+
+ggplot(df, aes(x = position, y = abs_sum)) + geom_point() + geom_smooth(method = "gam") + theme_bw()
+ggplot(df, aes(x = position, y = sum)) + geom_point() + theme_bw()
+```
+
+This time, the importance is scattered across positions in a more complex way, which reflects the nature of genetic data.
+
+We also visualize the direct sum, since some points persistently have negative gradients. The implication of these is still unknown.
+
+The same information compression technique is shown below.
+
+```{r igmod}
+df_mod <- df %>%
+  mutate(group = rep(1:(nrow(df) / 3), each = 3)) %>%
+  group_by(group) %>%
+  summarise(
+    abs_sum_sum = sum(abs_sum),
+    abs_sum_median = median(abs_sum),
+    abs_sum_mean = mean(abs_sum),
+    abs_sum_max = max(abs_sum),
+    sum_sum = sum(sum),
+    sum_median = median(sum),
+    sum_mean = mean(sum)
+  )
+
+ggplot(df_mod, aes(x = group)) +
+  # draw points of max
+  geom_point(aes(x = group, y = abs_sum_sum), color = "blue") +
+  geom_smooth(aes(y = abs_sum_sum, color = "Sum"), method = "auto", se = FALSE) +
+  geom_smooth(aes(y = abs_sum_median, color = "Median"), method = "auto", se = FALSE) +
+  geom_smooth(aes(y = abs_sum_mean, color = "Mean"), method = "auto", se = FALSE) +
+  geom_smooth(aes(y = abs_sum_max, color = "Max"), method = "auto", se = FALSE) +
+  scale_color_manual(values = c("Sum" = "blue", "Median" = "green", "Mean" = "orange", "Max"="purple")) +
+  theme_bw() +
+  labs(y = "Abs Sum of IG", color = "Statistic", x = "AA Index")
+
+ggplot(df_mod, aes(x = group)) +
+  # draw points of max
+  geom_point(aes(x = group, y = sum_mean), color = "orange") +
+  geom_smooth(aes(y = sum_sum, color = "Sum"), method = "auto", se = FALSE) +
+  geom_smooth(aes(y = sum_median, color = "Median"), method = "auto", se = FALSE) +
+  geom_smooth(aes(y = sum_mean, color = "Mean"), method = "auto", se = FALSE) +
+  scale_color_manual(values = c("Sum" = "blue", "Median" = "green", "Mean" = "orange")) +
+  theme_bw() +
+  labs(y = "Sum of IG", color = "Statistic", x = "AA Index")
+```
+
+```{r cluster}
+char <- strsplit(instance_sub, "")[[1]]
+trip_instance <- sapply(seq(1, length(char), by = 3), function(i) {
+  paste(char[i:min(i+2, length(char))], collapse = "")
+})
+keyed_instance <- triplets_keying(trip_instance)
+df_key <- data.frame(
+  trip = trip_instance,
+  key = keyed_instance,
+  group = 1:200
+)
+# left join df_key to df_clusters by group
+df_keyed <- left_join(df_mod, df_key, by = "group")
+```
+
+```{r bykey}
+df_keyed <- df_keyed %>%
+  mutate(cod1 = substr(trip, 1, 1),
+         cod23 = substr(trip, 2, 3))
+df_keyed <- df_keyed %>%
+  group_by(key) %>%
+  mutate(value = mean(sum_mean))
+
+hm1 <- ggplot(df_keyed, aes(x = cod1, y = cod23, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = key), color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) + 
+  theme_bw() +
+  labs(fill = "Average Mean\nof locus Sum",
+       x = "First Codon Position",
+       y = "Second and Third Codon Position") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        strip.text = element_text(face = "bold"),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+# hm1
+```
+
+We further studied wobleness (see Durrant & Bhatt). In this case, more randomness is introduced by the fact that we only calculated IG once. In RSDexport, the average importance almost consistently follow the 2-1-3 structure. Here, we tested some other instances and baselines and wobleness is not always detected.
+
+Here is an example of existing wobbleness.
+
+```{r wobleness}
+mean_codon <- sapply(1:3, function(i) {
+  mean(df$abs_sum[seq(i, 600, by = 3)])
+})
+# plot with line. x:1,2,3, y: mean_codon
+ggplot(data = data.frame(x = 1:3, y = mean_codon), aes(x = x, y = y)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Codon Position", y = "Mean Locus Abs Sum") +
+  # x tick only 1,2,3, integer
+  scale_x_continuous(breaks = 1:3, minor_breaks = NULL, labels = c("1", "2", "3"))
+
+codon_data <- data.frame(
+  position = rep(1:3, each = length(df$abs_sum) / 3),
+  abs_sum = unlist(lapply(1:3, function(i) df$abs_sum[seq(i, 600, by = 3)]))
+)
+
+# Box plot for each codon position
+ggplot(codon_data, aes(x = factor(position), y = abs_sum)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(x = "Codon Position", y = "Locus Abs Sum") +
+  scale_x_discrete(labels = c("1", "2", "3"))
+
+lm_model <- lm(abs_sum ~ factor(position), data = codon_data)
+
+# Summarize the linear model
+summary(lm_model)
+```
+
+## Consistency
+
+We then calculated PCSC score on our data. With an average score at 0.8, we conclude that the model was able to capture synonymous codons and treats them rather consistently.
+
+```{r PCSIV1, cache=TRUE}
+# ok-mutate based on instance, 100 times, saved to pcss_df
+# just use permute_sequence, nothing else
+pcss_df <- data.frame(permuted = instance_sub)
+for (i in 1:999) {
+  permuted_instance <- permute_sequence(trip_instance, type = "ok", min.subs = 5,
+                                        max.subs = 30, dict = codon.dict,
+                                        spec.cond = FALSE, spec.region = NULL)
+  permuted_instance <- paste(permuted_instance, collapse = "")
+  pcss_df <- rbind(pcss_df, data.frame(permuted = I(list(permuted_instance))))
+}
+list_onehot <- lapply(pcss_df$permuted, function(x) {
+  seq_encoding_label(char_sequence = x, maxlen = 600, start_ind = 1, vocabulary = c("A", "C", "G", "T"))
+})
+```
+
+```{r PCSIV2, cache=TRUE}
+csv_file_path <- "pcssdata_16s.csv"
+
+# Check if the CSV file already exists
+if (file.exists(csv_file_path)) {
+  # If it exists, read the CSV into result_df
+  result_df <- read.csv(csv_file_path)
+  message("Loaded result_df from existing CSV file.")
+} else {
+# Initialize an empty dataframe with the position column
+  result_df <- data.frame(position = 1:600)
+
+# Loop through each one-hot encoded instance in the list
+  for (i in seq_along(list_onehot)) {
+    onehot_instance <- list_onehot[[i]]
+  
+  # Compute Integrated Gradients
+    igw <- ig_modified(
+      input_seq = onehot_instance,
+      baseline_type = "modify",
+      baseline_onehot = onehot_baseline,
+      target_class_idx = 1,
+      model = model,
+      num_baseline_repeats = 1)
+  
+  # Compute the absolute sum of the IG scores
+    abs_sum <- rowSums(abs(as.array(igw)))
+  
+  # Add the abs_sum as a new column in the result_df
+    result_df[[paste0("abssum", i)]] <- abs_sum
+  }
+  write.csv(result_df, csv_file_path, row.names = FALSE)
+}
+```
+
+```{r PCSIV3, cache=TRUE}
+calculate_mean_every_three_rows <- function(df) {
+  # Calculate the number of groups (each group will consist of three rows)
+  n_groups <- nrow(df) %/% 3
+  
+  # Initialize an empty list to store the means
+  mean_list <- list()
+  
+  # Loop through each group and calculate the mean for each column
+  for (i in 1:n_groups) {
+    # Select the three rows corresponding to the current group
+    rows <- df[((i-1) * 3 + 1):(i * 3), ]
+    
+    # Calculate the mean for each column in the current group
+    mean_row <- colSums(rows)
+    
+    # Append the result to the list
+    mean_list[[i]] <- mean_row
+  }
+  
+  # Combine the results into a new dataframe
+  mean_df <- do.call(rbind, mean_list)
+  
+  return(mean_df)
+}
+
+# Apply the function to result_df
+result_df_mean <- calculate_mean_every_three_rows(result_df)
+
+# Convert the result to a data frame with appropriate column names
+result_df_mean <- as.data.frame(result_df_mean)
+names(result_df_mean) <- names(result_df)
+result_df_mean <- result_df_mean %>%
+  dplyr::select(-position)
+
+# Function to calculate the coefficient of variance (CV) for each row
+calculate_cv_rowwise <- function(df) {
+  # Apply the function to calculate CV (sd/mean) row-wise
+  cv <- apply(df[-1], 1, function(row) {
+    row_sd <- sd(row, na.rm=TRUE)
+    row_mean <- mean(row, na.rm=TRUE)
+    if (row_mean != 0) {
+      return(row_sd / row_mean)
+    } else {
+      return(NA)  # Handle division by zero
+    }
+  })
+  return(cv)
+}
+invtrans <- function(x) {
+  return(1 / (1 + x))
+}
+
+# Apply the function to result_df_mean (excluding the first column "position")
+rowwise_std <- calculate_cv_rowwise(result_df_mean)
+pcss_final <- data.frame(position=1:length(rowwise_std), key = keyed_instance,
+                         trip_instance, sig.cv=invtrans(rowwise_std))
+
+# plot pcss_final, x:position, y:cv, draw a horizontal line for the mean(pcss_final$cv), and mark its y coordinate
+ggplot(pcss_final, aes(x = position, y = sig.cv)) +
+  geom_line() +
+  geom_hline(yintercept = mean(pcss_final$sig.cv, na.rm=TRUE), linetype = "dashed", lwd=1, color = "red") +
+  geom_point() +
+  theme_bw() +
+  labs(x = "AA Index", y = "PCSC Score")
+```
+
+We then generated heatmaps as in RSDexport. The first heatmap visualizes average sum of gradients, the second average consistency based on AA, and the third the "confident importance", which is average sum of gradients multiplied by PCSC score.
+
+```{r pcss4}
+pcss_final <- pcss_final %>%
+  mutate(cod1 = substr(trip_instance, 1, 1),
+         cod23 = substr(trip_instance, 2, 3))
+pcss_final <- pcss_final %>%
+  group_by(key) %>%
+  mutate(value = mean(sig.cv))
+hm1
+hm2 <- ggplot(pcss_final, aes(x = cod1, y = cod23, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = key), color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "lightgrey", high = "red", midpoint = 0.7) + 
+  theme_bw() +
+  labs(fill = "Average PCSC",
+       x = "First Codon Position",
+       y = "Second and Third Codon Position") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        strip.text = element_text(face = "bold"),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hm2
+
+combined <- left_join(pcss_final, df_keyed, by = c("position" = "group"))
+combined <- combined %>%
+  mutate(conf = value.x*value.y)
+
+hm3 <- ggplot(combined, aes(x = cod1.x, y = cod23.x, fill = conf)) +
+  geom_tile() +
+  geom_text(aes(label = key.x), color = "black", size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) + 
+  theme_bw() +
+  labs(fill = "Confident\nImportance",
+       x = "First Codon Position",
+       y = "Second and Third Codon Position") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        strip.text = element_text(face = "bold"),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+hm3
+```
+
+## Feature Selection
+
+We then implemented the feature selection algorithm as by the enhanced IG paper. We do this based on locus level, and sample 50 events for both interest and random group.
+
+We performed one-sided t-test row-wise (only select positions with absolute sum of gradients larger than the random group). We applied Bonferroni Correction. (/600)
+
+In the end, 33 out of 600 loci are identified as having significantly higher absolute sum of gradients than the random group.
+
+We visualize these pairs, and notice that high importance points are not necessarily helpful in distinguishing instances, since the two curves are very similar in shape.
+
+```{r feature selection, cache=TRUE}
+# randomly sample 20 file names from 16s_features/16s folder (combined as a vector interest_files)
+# then, randomly sample 10 from 16s_features/16s, and 10 from from 16s_features/bacteria (combined as a vector random_files)
+files_16s <- list.files(path = "16s_features/16s", full.names = TRUE)
+files_bacteria <- list.files(path = "16s_features/bacteria", full.names = TRUE)
+set.seed(42)
+interest_files <- sample(files_16s, 50)
+random_files_16s <- sample(files_16s, 28)
+random_files_bacteria <- sample(files_bacteria, 22)
+random_files <- c(random_files_16s, random_files_bacteria)
+interest_sequences <- sapply(interest_files, function(file) {
+  microseq::readFasta(file)$Sequence[1]
+})
+random_sequences <- sapply(random_files, function(file) {
+  microseq::readFasta(file)$Sequence[1]
+})
+interest_substrings <- substr(interest_sequences, 499, 1098)
+random_substrings <- substr(random_sequences, 499, 1098)
+interest_encoded <- lapply(interest_substrings, function(substring) {
+  seq_encoding_label(char_sequence = substring,
+                     maxlen = 600,
+                     start_ind = 1,
+                     vocabulary = c("A", "C", "G", "T"))
+})
+
+# Apply seq_encoding_label to each substring in random_substrings
+random_encoded <- lapply(random_substrings, function(substring) {
+  seq_encoding_label(char_sequence = substring,
+                     maxlen = 600,
+                     start_ind = 1,
+                     vocabulary = c("A", "C", "G", "T"))
+})
+```
+
+```{r fs2, cache=TRUE}
+csv_file_path1 <- "featureimp_16s.csv"
+
+# Check if the CSV file already exists
+if (file.exists(csv_file_path1)) {
+  # If it exists, read the CSV into interest_df
+  interest_df <- read.csv(csv_file_path1)
+  message("Loaded interest_df from existing CSV file.")
+} else {
+# Initialize an empty dataframe with the position column
+  interest_df <- data.frame(position = 1:600)
+
+# Loop through each one-hot encoded instance in the list
+  for (i in seq_along(interest_encoded)) {
+    onehot_instance <- interest_encoded[[i]]
+  
+  # Compute Integrated Gradients
+    igw <- ig_modified(
+      input_seq = onehot_instance,
+      baseline_type = "modify",
+      baseline_onehot = onehot_baseline,
+      target_class_idx = 1,
+      model = model,
+      num_baseline_repeats = 1)
+  
+  # Compute the absolute sum of the IG scores
+    abs_sum <- rowSums(abs(as.array(igw)))
+  
+  # Add the abs_sum as a new column in the interest_df
+    interest_df[[paste0("abssum", i)]] <- abs_sum
+  }
+  write.csv(interest_df, csv_file_path1, row.names = FALSE)
+}
+
+csv_file_path2 <- "featureimp_bacteria.csv"
+
+# Check if the CSV file already exists
+if (file.exists(csv_file_path2)) {
+  # If it exists, read the CSV into random_df
+  random_df <- read.csv(csv_file_path2)
+  message("Loaded random_df from existing CSV file.")
+} else {
+# Initialize an empty dataframe with the position column
+  random_df <- data.frame(position = 1:600)
+
+# Loop through each one-hot encoded instance in the list
+  for (i in seq_along(random_encoded)) {
+    onehot_instance <- random_encoded[[i]]
+  
+  # Compute Integrated Gradients
+    igw <- ig_modified(
+      input_seq = onehot_instance,
+      baseline_type = "modify",
+      baseline_onehot = onehot_baseline,
+      target_class_idx = 1,
+      model = model,
+      num_baseline_repeats = 1)
+  
+  # Compute the absolute sum of the IG scores
+    abs_sum <- rowSums(abs(as.array(igw)))
+  
+  # Add the abs_sum as a new column in the random_df
+    random_df[[paste0("abssum", i)]] <- abs_sum
+  }
+  write.csv(random_df, csv_file_path2, row.names = FALSE)
+}
+```
+
+```{r fs3}
+# Initialize a result data frame to store position, row mean, and p-value
+result_df <- data.frame(
+  position = numeric(),
+  row_mean = numeric(),
+  random_mean = numeric(),
+  p_value = numeric()
+)
+
+# Number of tests for Bonferroni correction
+n_tests <- nrow(interest_df)
+
+# Loop over each row (position) in the data frames
+for (i in 1:n_tests) {
+  
+  # Get the position (object index)
+  position <- interest_df[i, 1]
+  
+  # Calculate the mean of the metrics in the interest_df for this position
+  interest_mean <- mean(as.numeric(interest_df[i, 2:ncol(interest_df)]), na.rm=TRUE)
+  random_mean <- mean(as.numeric(random_df[i, 2:ncol(random_df)]), na.rm=TRUE)
+  # Perform a one-sided t-test comparing interest_df to random_df
+  t_test_result <- t.test(
+    as.numeric(interest_df[i, 2:ncol(interest_df)]), 
+    as.numeric(random_df[i, 2:ncol(random_df)]), 
+    alternative = "greater"
+  )
+  
+  # Extract the p-value
+  p_value <- t_test_result$p.value
+  
+  # Append the results to result_df
+  result_df <- rbind(result_df, data.frame(
+    position = position,
+    row_mean = interest_mean,
+    random_mean = random_mean,
+    p_value = p_value
+  ))
+}
+
+result_df$significance <- ifelse(result_df$p_value < 0.05 / 600, "*", "")
+```
+
+```{r fs4}
+selected <- result_df %>% filter(significance == "*")
+# plot row mean and random mean together
+ggplot(result_df, aes(x = position)) +
+  geom_line(aes(y = row_mean, color = "Interest"), alpha = 0.2) +  # Interest mean line
+  geom_line(aes(y = random_mean, color = "Random"), alpha = 0.2) +  # Random mean line
+  geom_point(data = selected, aes(y = row_mean, color = "Interest")) +  # Selected interest mean points
+  geom_point(data = selected, aes(y = random_mean, color = "Random")) +  # Selected random mean points
+  geom_segment(data = selected, aes(xend = position, y = row_mean, yend = random_mean), color = "black") +  # Difference line
+  scale_color_manual(values = c("Interest" = "blue", "Random" = "red"),
+                     labels = c("Interest", "Random")) +
+  theme_bw() +
+  theme(legend.position = "bottom", legend.title = element_blank()) +
+  labs(x = "Locus Index", y = "Mean Locus Abs Sum", subtitle = "Sample Size = 50, Selected 33 out of 600, Bonferroni Correction")
+```
+
+We further explore the consitution of those important features. We only extracted the indices, and we compare them with one of the instances and extract the AA position of those points.
+
+At the moment, **more A and G seem to be present.**
+
+We noticed some consecutive pairs -- loci that are next to each other and are all significant in test. They are extracted for possible study.
+
+```{r fs5}
+# add AApos to selected: rounded position/3, to upper integer
+selected <- selected %>%
+  mutate(AApos = ceiling(position / 3))
+# add trip and key column from df_keyed, indexed by AApos == group, don't add unnecessary cols
+selected_ana <- left_join(selected, df_keyed, by = c("AApos" = "group")) %>%
+  select(position, row_mean, random_mean, p_value, significance, AApos, trip, key)
+
+# extract trip, split each letter into a single string, reshape to a vector of single letter strings
+selected_trip <- selected_ana$trip
+selected_trip <- strsplit(selected_trip, "")
+selected_trip <- unlist(selected_trip)
+print("ACGT content of selected features:")
+table(selected_trip)
+
+selected_key <- selected_ana$key
+print("Table of corresponding amino acids of selected features:")
+table(selected_key)
+
+# extract consecutive pairs: that is if AApos is only +1 compared to the former row
+# also extract the former row
+consecutive <- selected_ana %>%
+  filter(AApos %in% c(13,14,77,78,79,103,104,123,124,190,191))
+consecutive
+consecutive_trip <- consecutive$trip
+consecutive_trip <- strsplit(consecutive_trip, "")
+consecutive_trip <- unlist(consecutive_trip)
+print("ACGT content of selected, consecutive features:")
+table(consecutive_trip)
+print("Table of corresponding amino acids of selected, consecutive features:")
+table(consecutive$key)
+```
+
+We have visualized the selected features in **a sequence logo plot**. Keep in mind that here, G and A are present with relatively high confidence.
+
+```{r seqlogo, message=FALSE, warning=FALSE}
+replace_with_dash <- function(sequence, positions) {
+  sapply(1:nchar(sequence), function(i) {
+    if (i %in% positions) {
+      substr(sequence, i, i)
+    } else {
+      "-"
+    }
+  }) %>% paste(collapse = "")
+}
+positions <- selected$position
+# Apply the function to each gene sequence
+modified_sequences <- sapply(interest_substrings, replace_with_dash, positions)
+p1 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(0,45)
+p3 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(120,150)
+p4 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(160,190)
+p5 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(225,240)
+p6 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(250,280)
+p7 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(300,350)
+p8 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(350,400)
+p9 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(400,425)
+p10 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(450,465)
+p11 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(535,545)
+p12 <- ggplot() + geom_logo(modified_sequences) + theme_logo() +
+  xlim(560,590)
+
+first_six <- (p1 | p3) / (p4 | p5) / (p7 | p6)
+# Second group of 6 plots (3x2)
+second_six <- (p8 | p9) / (p10 | p11) / p12
+
+# Display the two graphs
+first_six
+second_six
+```
+
+## Adversarial
+
+We also tried adversarial instances. We replace the selected spots of the instance all with C, and the confidence for 16S rRNA drops dramatically! Also replacing them with T reduces the confidence to 0.20. Replacing with A and G is not effective.
+
+We compare them with an exact same number of randomly selected positions and substitute them accordingly too.
+
+We also tried replacing them with 0.25, and the confidence drops only a little bit. There is also only little difference of confidence between the selected features and randomly sampled features. 
+
+```{r adversarial, cache=TRUE}
+adversarial <- onehot_instance
+pred_vor <- predict(model, adversarial, verbose = 0)
+print("Original Prediction: ")
+pred_vor
+adversarial[,selected$position,] <- onehot_instance[,selected$position,]*0
+adversarial[,selected$position, 2] <- 1
+pred_adv <- predict(model, adversarial, verbose = 0)
+print("Prediction after substituting important features with C: ")
+pred_adv
+
+### counter-adversarial: replace not selected$position:
+counter <- onehot_instance
+pred_counter_results <- numeric(200)
+# Loop 100 times
+for (i in 1:200) {
+  # Sample indices from not_selected
+  indices <- sample(seq_len(ncol(onehot_instance)), length(selected$position))
+  
+  # Create a counter-adversarial example
+  counter <- onehot_instance
+  counter[,indices,] <- onehot_instance[,indices,]*0
+  counter[,indices, 2] <- 1
+  
+  # Make prediction on the counter-adversarial example
+  pred_counter <- predict(model, counter, verbose = 0)
+  
+  # Store the result for pred_counter[1,1]
+  pred_counter_results[i] <- pred_counter[1,1]
+}
+
+# Calculate the mean of the pred_counter[1,1] values
+mean_pred_counter <- mean(pred_counter_results)
+
+# Print the mean
+print("Prediction after substituting same amount of random features with C: ")
+mean_pred_counter
+
+### replacing with A
+adversarial <- onehot_instance
+adversarial[,selected$position,] <- onehot_instance[,selected$position,]*0
+adversarial[,selected$position, 1] <- 1
+pred_adv <- predict(model, adversarial, verbose = 0)
+print("Prediction after substituting important features with A: ")
+pred_adv
+
+### counter-adversarial: replace not selected$position:
+counter <- onehot_instance
+pred_counter_results <- numeric(200)
+# Loop 100 times
+for (i in 1:200) {
+  # Sample indices from not_selected
+  indices <- sample(seq_len(ncol(onehot_instance)), length(selected$position))
+  
+  # Create a counter-adversarial example
+  counter <- onehot_instance
+  counter[,indices,] <- onehot_instance[,indices,]*0
+  counter[,indices, 1] <- 1
+  
+  # Make prediction on the counter-adversarial example
+  pred_counter <- predict(model, counter, verbose = 0)
+  
+  # Store the result for pred_counter[1,1]
+  pred_counter_results[i] <- pred_counter[1,1]
+}
+
+# Calculate the mean of the pred_counter[1,1] values
+mean_pred_counter <- mean(pred_counter_results)
+
+# Print the mean
+print("Prediction after substituting same amount of random features with A: ")
+mean_pred_counter
+
+### replacing with 0.25
+
+adversarial[,selected$position,] <- onehot_instance[,selected$position,]*0 + 0.25
+pred_adv <- predict(model, adversarial, verbose = 0)
+print("Prediction after substituting important features with 0.25:")
+pred_adv
+
+### counter-adversarial: replace not selected$position:
+counter <- onehot_instance
+pred_counter_results <- numeric(200)
+# Loop 100 times
+for (i in 1:200) {
+  # Sample indices from not_selected
+  indices <- sample(seq_len(ncol(onehot_instance)), length(selected$position))
+  
+  # Create a counter-adversarial example
+  counter <- onehot_instance
+  counter[,indices,] <- onehot_instance[,indices,]*0 + 0.25
+  
+  # Make prediction on the counter-adversarial example
+  pred_counter <- predict(model, counter, verbose = 0)
+  
+  # Store the result for pred_counter[1,1]
+  pred_counter_results[i] <- pred_counter[1,1]
+}
+
+# Calculate the mean of the pred_counter[1,1] values
+mean_pred_counter <- mean(pred_counter_results)
+
+# Print the mean
+print("Prediction after substituting same amount of random features with 0.25:")
+mean_pred_counter
+```
+
+We would like to study the drastic drop of prediction confidence when more C and T are introduced.
+
+## Input Reconstruction
+
+We tried reconstructing the input sequence using a non-informative baseline, where A,C,G,T each has 0.1 for each position. We attempted 0.25, but the algorithm did not converge. Also choosing a bacteria sub-sequence leads to a non-converging result. This seems to be interesting.
+
+This is done by iteratively doing:
+
+$$X^{(t+1)} = X^{(t)} + \epsilon \cdot IG(X^{(t)})$$
+
+We set $\epsilon = 2$.
+
+```{r recon}
+# we now use igs to reconstruct instance that can be predicted as 1 at confidence 0.8
+# we do: baseline_(t+1) = baseline_(t) + 0.001 * igs, and go through model
+# if pred[1] > 0.8, break the loop.
+# predict using predict(model, onehot_instance, verbose = 0)
+count <- 0
+epsilon <- 2
+baseline <- onehot_instance * 0 + 0.1
+conf <- numeric()
+# Iteratively update the baseline
+repeat {
+  # Compute Integrated Gradients for the current baseline
+  igt <- ig_modified(
+  input_seq = onehot_instance,
+  baseline_type = "modify",
+  baseline_onehot = baseline,
+  target_class_idx = 1,
+  model = model,
+  num_baseline_repeats = 1)
+  
+  # Update the baseline input
+  baseline <- baseline + epsilon * igt
+  count <- count + 1
+  # Predict using the updated baseline
+  pred <- predict(model, baseline, verbose = 0)
+  conf <- c(conf, pred[1,1])
+  # print(paste0("Iteration", count, ": ", pred[1,1]))
+  # Check the prediction for class "1"
+  if (pred[1,1] > 0.9) {
+    break
+  }
+}
+```
+
+We plot the learning curve and the sequence logo (customed using final IG as y-axis) for a segment of the sequence.
+
+Interpretation: the achieved representation is the least required to be predicted as 16S rRNA gene with a confidence of 90%.
+
+```{r reconplot, cache=TRUE}
+# line plot for conf
+ggplot(data = data.frame(iteration = 1:length(conf), conf = conf), aes(x = iteration, y = conf)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  labs(x = "Iteration", y = "Confidence")
+# Convert the array to a data frame for ggplot
+baseline.arr <- as.array(baseline)
+baseline.arr <- t(baseline.arr[1,,])
+df <- as.data.frame(baseline.arr)
+
+# Add row names for A, C, G, T
+rownames(df) <- c("A", "C", "G", "T")
+df_mat <- as.matrix(df)
+ggseqlogo(df_mat, method='custom', seq_type='dna') + xlim(50,100) + ylim(-1.1,1.1) +
+  labs(x="bp", y="IG")
+```
+
+Pay extra attention to the reconstructed sequence logo plot. In the negative region, C and T often have considerably negative weights, meaning they should not appear on this position if the prediction is 16S. This could explain why the adversarial scenario where more Cs are included caused dramatic drop in confidence.
+
+We also table the matching positions of the reconstructed sequence comparing the original one. Compared to selected features, we see the matching positions seem not to be totally away from the selected ones. Could this be of interest?
+
+```{r reconeval}
+# make the max of each baseline[,i,] 1 and the rest 0
+onehot_baseline <- as.array(baseline)
+for (j in 1:dim(onehot_baseline)[2]) {
+  # Find the index of the maximum value in the 4 values
+  max_index <- which.max(onehot_baseline[1, j, ])
+  
+  # Set the maximum value position to 1 and others to 0
+  onehot_baseline[1, j, ] <- 0
+  onehot_baseline[1, j, max_index] <- 1
+}
+sequence <- character(600)
+
+# Define the mapping from index to nucleotide
+nucleotide_map <- c("A", "C", "G", "T")
+
+# Loop over the 477 positions
+for (i in 1:600) {
+  # Find the index where the value is 1
+  nucleotide_index <- which(onehot_baseline[1, i, ] == 1)
+  
+  # Map the index to the corresponding nucleotide
+  sequence[i] <- nucleotide_map[nucleotide_index]
+}
+
+# Collapse the character vector into a single string
+sequence_string <- paste(sequence, collapse = "")
+```
+
+```{r reconkey}
+recon_split <- strsplit(sequence_string, "")[[1]]
+recon_trip <- tokenize_triplets(recon_split)
+recon_keyed <- triplets_keying(recon_trip)
+ins_split <- strsplit(instance_sub, "")[[1]]
+ins_trip <- tokenize_triplets(ins_split)
+ins_keyed <- triplets_keying(ins_trip)
+
+# positions where name of recon_keyed == ins_keyed
+matched <- which(recon_keyed == ins_keyed)
+print("Matched Reconstructed sequence and original sequence, AA position: ")
+matched
+print("Selected features, AA position: ")
+ceiling(selected$position / 3)
+```
+
+## Discussion
+
+Main Point: **IML in Genomics: What comes after non-informative local interpretations? The Interpretation of Interpretations**
+
+1. Due to lack of clear patterns in most real-world cases, it seems IG alone, even if correctly calculated, can be very much not informative. Instead of keep improving its theory minimally, it seems more reasonable to come up with methods tailored to genomics that can best utilize those data and provide interpretable or meaningful results. For example, the PCSC score could be a good measurement in explaining the reliability of the model in capturing synonymous codons.
+
+2. How to work with the selected features? Are they biologically significant? Are they useful in distinguishing instances? (for which we need to adjust the model) These are questions that need to be answered in the future.
+
+3. I personally find the convergence of feature reconstruction fascinating. For some reasonable targets, e.g. a bacterial sequence, it is not possible to transform it to a possible 16S simply using IG outputs.
+
+4. The choice of baseline can be further studied. Choosing a real sequence from the other category can include too much artifact than truth.

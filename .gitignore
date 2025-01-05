@@ -1,0 +1,47 @@
+# RStudio project files
+.Rproj.user/
+*.Rproj
+.Rhistory
+.RData
+.Ruserdata
+
+# Compiled code
+*.o
+*.so
+*.dll
+
+# Cache and logs
+*.rdb
+*.rds
+*.RDataTmp
+*.log
+*.out
+
+# Packages
+*.tar.gz
+*.zip
+
+# Temporary files
+*.tmp
+*.swp
+*.bak
+*.backup
+
+# Hidden system files
+.DS_Store
+Thumbs.db
+
+# Python virtual environments (if included)
+venv/
+__pycache__/
+
+# Data files
+*.csv
+*.tsv
+*.sav
+*.dta
+*.rda
+*.rds
+*.fasta
+*.FASTA
+*.gff
