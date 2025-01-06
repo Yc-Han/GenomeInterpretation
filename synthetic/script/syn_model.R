@@ -9,24 +9,24 @@ library(tensorflow)
 library(magrittr)
 library(data.table)
 
-py_config()
-
 # Check GPU visibility
 physical_gpus <- tf$config$list_physical_devices("GPU")
 print(physical_gpus)
 
 set.seed(42)
 
-filters <- c(32,32,64,64,128,128,256)
+filters <- c(32, 64, 64, 128, 128, 256)
+kernels <- c(12, 16, 24, 24, 32, 32)
+pools <- c(2, 2, 4, 4, 4, 4)
 
 model <- create_model_lstm_cnn(
   maxlen = 1000000,
   layer_lstm = NULL,
-  layer_dense = c(256,2),
-  learning_rate = 0.000001,
+  layer_dense = c(128, 64, 2),
+  learning_rate = 0.00001,
   filters = filters,
-  kernel_size = rep(24, length(filters)),
-  pool_size = rep(4, length(filters)))
+  kernel_size = kernels,
+  pool_size = pools)
 
 target_from_csv <- "synthetic/file_labels.csv"
 target_df <- read.csv(target_from_csv)
@@ -45,13 +45,15 @@ hist <- train_model(
   path_val = val_path,
   path_checkpoint = check_path,
   train_val_ratio = 0.5,
-  run_name = "synthetic_1",
-  batch_size = 16,
-  epochs = 50,
+  run_name = "synthetic_2",
+  batch_size = 32,
+  epochs = 100,
   steps_per_epoch = 100,
   format = "fasta",
   concat_seq = "",
-  vocabulary_label = label_names)
+  vocabulary_label = label_names,
+  lr_plateau_factor = 0.8,
+  patience = 10)
 
 plot_path <- file.path(check_path, "plot")
 if (!dir.exists(plot_path)) { 

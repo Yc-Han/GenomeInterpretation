@@ -83,9 +83,7 @@ iconic_species <- c(
 # Ensure that the species vector is named with the corresponding orders
 names(iconic_species) <- bacterial_orders
 
-set.seed(42) 
-
-labelled_yes_orders <- sample(bacterial_orders, 20)
+labelled_yes_orders <- read.csv("synthetic/labelled_yes_orders.csv", stringsAsFactors = FALSE)
 
 startcodon <- "ATG"
 
@@ -104,10 +102,10 @@ source("genepermutation.R")
 mutate_sequence <- function(
     sequence,
     codon.dict,
-    codon_mutation_rate = 1e-2,       # Probability of synonymous mutation per codon
-    event_rate_per_Mbp  = 0.75,       # Probability for insertion/deletion/replacement per 10kbp
-    event_interval      = 1e4,        # Interval for event rate (10 kbp)
-    max_indel_length    = 5000        # Max length for insertion/deletion/replacement
+    codon_mutation_rate  = 0.1,           # Probability of synonymous mutation per codon
+    indel_event_rate     = 0.75,          # Probability for insertion/deletion/replacement
+    indel_event_interval = 1e4,           # Interval for event rate (10 kbp)
+    max_indel_length     = 5e3            # Max length for insertion/deletion/replacement
 ) {
   #----------------------------#
   # 1) SYNONYMOUS CODON MUTATION
@@ -147,10 +145,10 @@ mutate_sequence <- function(
   #----------------------------#
   # 2) INSERTIONS, DELETIONS, REPLACEMENTS
   #----------------------------#
-  # For each 1 Mb (1e6 bp), there's event_rate_per_Mbp chance
+  # For each 1 Mb (1e6 bp), there's indel_event_rate chance
   # => Expected number of each event is:
   seq_length <- length(mutated_seq_vector)
-  expected_events <- event_rate_per_Mbp * (seq_length / event_interval)
+  expected_events <- indel_event_rate * (seq_length / indel_event_interval)
   
   # Draw how many insertions, deletions, replacements to perform (Poisson)
   n_insert   <- rpois(1, lambda = expected_events)
@@ -443,11 +441,19 @@ insert_downloaded_genes <- function(
 }
 
 args <- commandArgs(trailingOnly = TRUE)
-if(length(args) == 0) {
-  stop("No arguments supplied.")
+
+# Check if at least two arguments were supplied
+if(length(args) < 2) {
+  stop("Usage: Rscript job_script.R <seqpath> <seed>")
 }
 
+# Assign arguments to variables
 seqpath <- args[1]
+seed <- as.numeric(args[2])
+
+# Set the seed for reproducibility
+set.seed(seed)
+cat("Using seed:", seed, "\n")
 
 # Parallel loop over sourceseqs with parLapply
 run_process <- function(seqpath) {
@@ -459,10 +465,10 @@ run_process <- function(seqpath) {
   
   # Split seqs into a single-nucleotide vector
   seqs <- unlist(strsplit(seqs, ""))
-  
+  original_seqs <- seqs
   # Mutate the sequence 4 times, append to the original
   for (i in 1:4) {
-    mutated_seq <- mutate_sequence(seqs, codon.dict)
+    mutated_seq <- mutate_sequence(original_seqs, codon.dict)
     seqs <- c(seqs, mutated_seq)
     cat("Mutation", i, "done for:", basename(seqpath), "\n")
   }
